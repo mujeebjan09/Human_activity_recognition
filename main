@@ -1,9 +1,9 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt
+from scipy.signal import savgol_filter
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.utils.class_weight import compute_class_weight
+from sklearn.decomposition import PCA
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, ConfusionMatrixDisplay
@@ -18,13 +18,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow as tf
 
-# Step 1: Load, preprocess, and apply Butterworth noise filter to the data
-def butterworth_filter(data, cutoff=0.3, fs=50, order=4):
-    nyquist = 0.5 * fs
-    normal_cutoff = cutoff / nyquist
-    b, a = butter(order, normal_cutoff, btype='low', analog=False)
-    return filtfilt(b, a, data, axis=0)
-
+# Step 1: Load, preprocess, and apply Savitzky-Golay noise filter
 def load_preprocess_filter_data():
     # Load training and test datasets
     train_data = pd.read_csv('/content/train.csv')
@@ -46,53 +40,31 @@ def load_preprocess_filter_data():
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
 
-    # Apply Butterworth noise filter
-    X_train = butterworth_filter(X_train)
-    X_test = butterworth_filter(X_test)
+    # Apply Savitzky-Golay filter
+    X_train = savgol_filter(X_train, window_length=11, polyorder=3, axis=0)
+    X_test = savgol_filter(X_test, window_length=11, polyorder=3, axis=0)
 
     return train_data, X_train, y_train, X_test, y_test, label_encoder
+
+# Step 2: Automatically select optimal PCA components
+def find_optimal_pca_components(X_train, threshold=0.95):
+    pca = PCA()
+    pca.fit(X_train)
+    cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
+    optimal_components = np.argmax(cumulative_variance >= threshold) + 1  # Index starts at 0
+    return optimal_components, pca
 
 # Load and preprocess data
 train_data, X_train, y_train, X_test, y_test, label_encoder = load_preprocess_filter_data()
 
-# Step 2: Autoencoder for Dimensionality Reduction
-def build_autoencoder(input_dim):
-    encoding_dim = 125  # Number of features after reduction
+# Find optimal PCA components and reduce data
+optimal_components, pca_full = find_optimal_pca_components(X_train, threshold=0.95)
+print(f"Optimal number of PCA components: {optimal_components}")
+pca = PCA(n_components=optimal_components)
+X_train_reduced = pca.fit_transform(X_train)
+X_test_reduced = pca.transform(X_test)
 
-    # Encoder
-    input_layer = Input(shape=(input_dim,))
-    encoded = Dense(256, activation='relu')(input_layer)
-    encoded = Dense(encoding_dim, activation='relu')(encoded)
-
-    # Decoder
-    decoded = Dense(256, activation='relu')(encoded)
-    decoded = Dense(input_dim, activation='sigmoid')(decoded)
-
-    # Autoencoder model
-    autoencoder = Model(inputs=input_layer, outputs=decoded)
-    autoencoder.compile(optimizer='adam', loss='mse')
-
-    # Encoder model for dimensionality reduction
-    encoder = Model(inputs=input_layer, outputs=encoded)
-
-    return autoencoder, encoder
-
-# Train Autoencoder
-input_dim = X_train.shape[1]
-autoencoder, encoder = build_autoencoder(input_dim)
-autoencoder.fit(
-    X_train, X_train,
-    epochs=100,
-    batch_size=1000,
-    validation_split=0.2,
-    shuffle=True
-)
-
-# Reduce dimensions
-X_train_reduced = encoder.predict(X_train)
-X_test_reduced = encoder.predict(X_test)
-
-# Step 3: GAN to augment data for 'Standing'
+# Step 3: GAN to augment data for 'STANDING'
 def create_gan(input_dim):
     generator = Sequential([
         Dense(128, activation='relu', input_dim=input_dim),
@@ -175,7 +147,7 @@ cnn_transformer_model = build_cnn_transformer(
 history = cnn_transformer_model.fit(
     X_train_cnn, y_train_one_hot,
     validation_split=0.2,
-    epochs=200,
+    epochs=100,
     batch_size=1000,
     callbacks=[EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)]
 )
