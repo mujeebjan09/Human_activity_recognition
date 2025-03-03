@@ -13,15 +13,15 @@ from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.layers import (
     Dense, Conv1D, Dropout, Input, BatchNormalization,
     MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D,
-    LeakyReLU, LSTM, RepeatVector, TimeDistributed
+    LeakyReLU
 )
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
 
-
+# ---------------------------
 # Step 1: Load, preprocess, and apply Savitzky-Golay noise filter
-
+# ---------------------------
 def load_preprocess_filter_data():
     train_data = pd.read_csv('/content/train.csv')
     test_data = pd.read_csv('/content/test.csv')
@@ -44,34 +44,34 @@ def load_preprocess_filter_data():
 
     return train_data, X_train, y_train, X_test, y_test, label_encoder
 
-
-# Step 2: Autoencoder-based Dimensionality Reduction 
-
+# ---------------------------
+# Step 2: Improved Autoencoder-based Dimensionality Reduction
+# ---------------------------
 def build_autoencoder(input_dim, encoding_dim):
     input_layer = Input(shape=(input_dim,))
-    # Encoder with LeakyReLU and Dropout
-    encoded = Dense(512)(input_layer)
-    encoded = LeakyReLU(alpha=0.1)(encoded)
-    encoded = Dropout(0.2)(encoded)
-    encoded = Dense(256)(encoded)
-    encoded = LeakyReLU(alpha=0.1)(encoded)
-    encoded = Dense(encoding_dim)(encoded)
-    encoded = LeakyReLU(alpha=0.1)(encoded)
-    # Decoder with LeakyReLU
-    decoded = Dense(256)(encoded)
-    decoded = LeakyReLU(alpha=0.1)(decoded)
-    decoded = Dense(512)(decoded)
-    decoded = LeakyReLU(alpha=0.1)(decoded)
-    decoded = Dense(input_dim, activation='sigmoid')(decoded)
-
+    # Encoder with LeakyReLU, increased capacity, and BatchNormalization
+    x = Dense(1024, activation='relu')(input_layer)
+    x = BatchNormalization()(x)
+    x = Dense(512, activation='relu')(x)
+    x = BatchNormalization()(x)
+    encoded = Dense(encoding_dim, activation='relu')(x)
+    
+    # Decoder with BatchNormalization
+    x = Dense(512, activation='relu')(encoded)
+    x = BatchNormalization()(x)
+    x = Dense(1024, activation='relu')(x)
+    x = BatchNormalization()(x)
+    # Use linear activation for reconstruction of standardized data
+    decoded = Dense(input_dim, activation='linear')(x)
+    
     autoencoder = Model(input_layer, decoded)
     encoder = Model(input_layer, encoded)
     autoencoder.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
     return autoencoder, encoder
 
-
-# Step 3: GAN to Augment Data for 'STANDING'
-
+# ---------------------------
+# Step 3: GAN to Augment Data for a Given Class
+# ---------------------------
 def create_gan(input_dim):
     generator = Sequential([
         Dense(128, activation='relu', input_dim=input_dim),
@@ -90,12 +90,12 @@ def create_gan(input_dim):
     gan.compile(optimizer=Adam(learning_rate=0.0001), loss='binary_crossentropy')
     return generator, discriminator, gan
 
-def train_gan(X_standing, generator, discriminator, gan, epochs=500, batch_size=128):
+def train_gan(X_class, generator, discriminator, gan, epochs=500, batch_size=128):
     for epoch in range(epochs):
-        idx = np.random.randint(0, X_standing.shape[0], batch_size)
-        real_samples = X_standing[idx]
+        idx = np.random.randint(0, X_class.shape[0], batch_size)
+        real_samples = X_class[idx]
 
-        noise = np.random.normal(0, 1, (batch_size, X_standing.shape[1]))
+        noise = np.random.normal(0, 1, (batch_size, X_class.shape[1]))
         fake_samples = generator.predict(noise)
 
         d_loss_real = discriminator.train_on_batch(real_samples, np.ones((batch_size, 1)))
@@ -107,48 +107,76 @@ def train_gan(X_standing, generator, discriminator, gan, epochs=500, batch_size=
         if epoch % 100 == 0:
             print(f"Epoch {epoch}: D Loss = {d_loss}, G Loss = {g_loss}")
 
-
+# ---------------------------
 # Step 4: Load and preprocess data, then reduce dimensions using Autoencoder
-
+# ---------------------------
 train_data, X_train, y_train, X_test, y_test, label_encoder = load_preprocess_filter_data()
 
 input_dim = X_train.shape[1]
 encoding_dim = 125  # Reduced dimension
 autoencoder, encoder = build_autoencoder(input_dim, encoding_dim)
-autoencoder.fit(X_train, X_train, epochs=200, batch_size=256, validation_split=0.2, verbose=1)
+autoencoder.fit(X_train, X_train, epochs=200, batch_size=32, validation_split=0.2, verbose=1)
 
 X_train_reduced = encoder.predict(X_train)
 X_test_reduced = encoder.predict(X_test)
 
+# ---------------------------
+# Step 5: Augment Data for Each Class to Achieve Even Balance
+# ---------------------------
+unique_labels = np.unique(y_train)
+# Compute original class counts
+counts = {label: np.sum(y_train == label) for label in unique_labels}
+print("Original class distribution:", counts)
+target_count = max(counts.values())
+print("Target count per class:", target_count)
 
-# Step 5: Augment Data for 'STANDING' using GAN
+synthetic_data_list = []
+synthetic_labels_list = []
 
-standing_idx = np.where(y_train == label_encoder.transform(['STANDING'])[0])[0]
-X_standing = X_train_reduced[standing_idx]
+for label in unique_labels:
+    current_count = counts[label]
+    num_to_generate = target_count - current_count
+    if num_to_generate > 0:
+        label_name = label_encoder.inverse_transform([label])[0]
+        print(f"\nAugmenting class {label_name}: Generating {num_to_generate} synthetic samples.")
+        X_label = X_train_reduced[np.where(y_train == label)[0]]
+        
+        generator, discriminator, gan = create_gan(input_dim=X_train_reduced.shape[1])
+        train_gan(X_label, generator, discriminator, gan, epochs=500, batch_size=128)
+        
+        noise = np.random.normal(0, 1, (num_to_generate, X_train_reduced.shape[1]))
+        synthetic_samples = generator.predict(noise)
+        
+        synthetic_data_list.append(synthetic_samples)
+        synthetic_labels_list.append(np.full((num_to_generate,), label))
+        
+if synthetic_data_list:
+    synthetic_data = np.vstack(synthetic_data_list)
+    synthetic_labels = np.hstack(synthetic_labels_list)
+    # Augment the training data with synthetic samples
+    X_train_augmented = np.vstack([X_train_reduced, synthetic_data])
+    y_train_augmented = np.hstack([y_train, synthetic_labels])
+else:
+    X_train_augmented = X_train_reduced
+    y_train_augmented = y_train
 
-generator, discriminator, gan = create_gan(input_dim=X_train_reduced.shape[1])
-train_gan(X_standing, generator, discriminator, gan)
-
-noise = np.random.normal(0, 1, (500, X_train_reduced.shape[1]))
-synthetic_standing = generator.predict(noise)
-synthetic_labels = np.full((500,), label_encoder.transform(['STANDING'])[0])
-
-X_train_augmented = np.vstack([X_train_reduced, synthetic_standing])
-y_train_augmented = np.hstack([y_train, synthetic_labels])
+# Check new augmented class distribution
+new_counts = {label: np.sum(y_train_augmented == label) for label in unique_labels}
+print("Augmented class distribution:", new_counts)
 
 # Shuffle augmented dataset
 X_train_augmented, y_train_augmented = shuffle(X_train_augmented, y_train_augmented, random_state=42)
 
-
+# ---------------------------
 # Step 6: One-hot Encoding
-
-num_classes = len(np.unique(y_train))
+# ---------------------------
+num_classes = len(unique_labels)
 y_train_one_hot = to_categorical(y_train_augmented, num_classes=num_classes)
 y_test_one_hot = to_categorical(y_test, num_classes=num_classes)
 
-
+# ---------------------------
 # Step 7: Build CNN-Transformer for Feature Extraction and Classification
-
+# ---------------------------
 def build_cnn_transformer(input_shape, num_classes):
     inputs = Input(shape=input_shape)
     x = Conv1D(filters=64, kernel_size=5, activation='relu')(inputs)
@@ -174,9 +202,9 @@ def build_cnn_transformer(input_shape, num_classes):
     model.compile(optimizer=Adam(learning_rate=0.0005), loss='categorical_crossentropy', metrics=['accuracy'])
     return model
 
-
+# ---------------------------
 # Step 8: Reshape Data for CNN Input and Train Model
-
+# ---------------------------
 X_train_cnn = X_train_augmented.reshape(-1, encoding_dim, 1)
 X_test_cnn = X_test_reduced.reshape(-1, encoding_dim, 1)
 
@@ -190,9 +218,9 @@ history = cnn_transformer_model.fit(
     callbacks=[EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)]
 )
 
-
+# ---------------------------
 # Step 9: Evaluate the Model
-
+# ---------------------------
 y_pred_proba = cnn_transformer_model.predict(X_test_cnn)
 y_pred = np.argmax(y_pred_proba, axis=1)
 
