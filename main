@@ -1,241 +1,193 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
+import seaborn as sns
+
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, ConfusionMatrixDisplay
-)
-from sklearn.utils import shuffle
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import confusion_matrix
+
 import tensorflow as tf
+from tensorflow.keras.layers import (Input, Dense, Conv1D, MaxPooling1D, Flatten, Dropout,
+                                     LeakyReLU, BatchNormalization, LayerNormalization, MultiHeadAttention)
 from tensorflow.keras.models import Model, Sequential
-from tensorflow.keras.layers import (
-    Dense, Conv1D, Dropout, Input, BatchNormalization,
-    MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D,
-    LeakyReLU
-)
-from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
 
-# ---------------------------
-# Step 1: Load, preprocess, and apply Savitzky-Golay noise filter
-# ---------------------------
-def load_preprocess_filter_data():
-    train_data = pd.read_csv('/content/train.csv')
-    test_data = pd.read_csv('/content/test.csv')
+# 1. Load dataset
+train = pd.read_csv('/content/train.csv')
+test = pd.read_csv('/content/test.csv')
 
-    X_train = train_data.iloc[:, :-2].values  # Exclude 'subject' and 'Activity'
-    y_train = train_data['Activity'].values
-    X_test = test_data.iloc[:, :-2].values    # Exclude 'subject' and 'Activity'
-    y_test = test_data['Activity'].values
+# Extract features and labels (assuming the last two columns are not features)
+X = train.iloc[:, :-2]
+y = train['Activity'].values
 
-    label_encoder = LabelEncoder()
-    y_train = label_encoder.fit_transform(y_train)
-    y_test = label_encoder.transform(y_test)
+# Convert string labels to integers
+le = LabelEncoder()
+y = le.fit_transform(y)
 
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+# 2. Preprocessing: Scale features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
 
-    X_train = savgol_filter(X_train, window_length=11, polyorder=5, axis=0)
-    X_test = savgol_filter(X_test, window_length=11, polyorder=5, axis=0)
+# 3. Feature Selection: Select top 125 features using ExtraTreesClassifier
+feat_selector = ExtraTreesClassifier(n_estimators=100, random_state=42)
+feat_selector.fit(X_scaled, y)
+importances = feat_selector.feature_importances_
+top_indices = np.argsort(importances)[-125:]
+X_reduced = X_scaled[:, top_indices]
 
-    return train_data, X_train, y_train, X_test, y_test, label_encoder
+# 4. GAN for Synthetic Data Generation
+noise_dim = 100
+data_dim = 125  # after feature selection
 
-# ---------------------------
-# Step 2: Improved Autoencoder-based Dimensionality Reduction
-# ---------------------------
-def build_autoencoder(input_dim, encoding_dim):
-    input_layer = Input(shape=(input_dim,))
-    # Encoder with LeakyReLU, increased capacity, and BatchNormalization
-    x = Dense(1024, activation='relu')(input_layer)
-    x = BatchNormalization()(x)
-    x = Dense(512, activation='relu')(x)
-    x = BatchNormalization()(x)
-    encoded = Dense(encoding_dim, activation='relu')(x)
-    
-    # Decoder with BatchNormalization
-    x = Dense(512, activation='relu')(encoded)
-    x = BatchNormalization()(x)
-    x = Dense(1024, activation='relu')(x)
-    x = BatchNormalization()(x)
-    # Use linear activation for reconstruction of standardized data
-    decoded = Dense(input_dim, activation='linear')(x)
-    
-    autoencoder = Model(input_layer, decoded)
-    encoder = Model(input_layer, encoded)
-    autoencoder.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-    return autoencoder, encoder
-
-# ---------------------------
-# Step 3: GAN to Augment Data for a Given Class
-# ---------------------------
-def create_gan(input_dim):
-    generator = Sequential([
-        Dense(128, activation='relu', input_dim=input_dim),
-        Dense(256, activation='relu'),
-        Dense(input_dim, activation='tanh')
-    ])
-
-    discriminator = Sequential([
-        Dense(256, activation='relu', input_dim=input_dim),
-        Dense(128, activation='relu'),
-        Dense(1, activation='sigmoid')
-    ])
-    discriminator.compile(optimizer=Adam(learning_rate=0.0001), loss='binary_crossentropy', metrics=['accuracy'])
-    discriminator.trainable = False
-    gan = Sequential([generator, discriminator])
-    gan.compile(optimizer=Adam(learning_rate=0.0001), loss='binary_crossentropy')
-    return generator, discriminator, gan
-
-def train_gan(X_class, generator, discriminator, gan, epochs=500, batch_size=128):
-    for epoch in range(epochs):
-        idx = np.random.randint(0, X_class.shape[0], batch_size)
-        real_samples = X_class[idx]
-
-        noise = np.random.normal(0, 1, (batch_size, X_class.shape[1]))
-        fake_samples = generator.predict(noise)
-
-        d_loss_real = discriminator.train_on_batch(real_samples, np.ones((batch_size, 1)))
-        d_loss_fake = discriminator.train_on_batch(fake_samples, np.zeros((batch_size, 1)))
-        d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
-
-        g_loss = gan.train_on_batch(noise, np.ones((batch_size, 1)))
-
-        if epoch % 100 == 0:
-            print(f"Epoch {epoch}: D Loss = {d_loss}, G Loss = {g_loss}")
-
-# ---------------------------
-# Step 4: Load and preprocess data, then reduce dimensions using Autoencoder
-# ---------------------------
-train_data, X_train, y_train, X_test, y_test, label_encoder = load_preprocess_filter_data()
-
-input_dim = X_train.shape[1]
-encoding_dim = 125  # Reduced dimension
-autoencoder, encoder = build_autoencoder(input_dim, encoding_dim)
-autoencoder.fit(X_train, X_train, epochs=200, batch_size=32, validation_split=0.2, verbose=1)
-
-X_train_reduced = encoder.predict(X_train)
-X_test_reduced = encoder.predict(X_test)
-
-# ---------------------------
-# Step 5: Augment Data for Each Class to Achieve Even Balance
-# ---------------------------
-unique_labels = np.unique(y_train)
-# Compute original class counts
-counts = {label: np.sum(y_train == label) for label in unique_labels}
-print("Original class distribution:", counts)
-target_count = max(counts.values())
-print("Target count per class:", target_count)
-
-synthetic_data_list = []
-synthetic_labels_list = []
-
-for label in unique_labels:
-    current_count = counts[label]
-    num_to_generate = target_count - current_count
-    if num_to_generate > 0:
-        label_name = label_encoder.inverse_transform([label])[0]
-        print(f"\nAugmenting class {label_name}: Generating {num_to_generate} synthetic samples.")
-        X_label = X_train_reduced[np.where(y_train == label)[0]]
-        
-        generator, discriminator, gan = create_gan(input_dim=X_train_reduced.shape[1])
-        train_gan(X_label, generator, discriminator, gan, epochs=500, batch_size=128)
-        
-        noise = np.random.normal(0, 1, (num_to_generate, X_train_reduced.shape[1]))
-        synthetic_samples = generator.predict(noise)
-        
-        synthetic_data_list.append(synthetic_samples)
-        synthetic_labels_list.append(np.full((num_to_generate,), label))
-        
-if synthetic_data_list:
-    synthetic_data = np.vstack(synthetic_data_list)
-    synthetic_labels = np.hstack(synthetic_labels_list)
-    # Augment the training data with synthetic samples
-    X_train_augmented = np.vstack([X_train_reduced, synthetic_data])
-    y_train_augmented = np.hstack([y_train, synthetic_labels])
-else:
-    X_train_augmented = X_train_reduced
-    y_train_augmented = y_train
-
-# Check new augmented class distribution
-new_counts = {label: np.sum(y_train_augmented == label) for label in unique_labels}
-print("Augmented class distribution:", new_counts)
-
-# Shuffle augmented dataset
-X_train_augmented, y_train_augmented = shuffle(X_train_augmented, y_train_augmented, random_state=42)
-
-# ---------------------------
-# Step 6: One-hot Encoding
-# ---------------------------
-num_classes = len(unique_labels)
-y_train_one_hot = to_categorical(y_train_augmented, num_classes=num_classes)
-y_test_one_hot = to_categorical(y_test, num_classes=num_classes)
-
-# ---------------------------
-# Step 7: Build CNN-Transformer for Feature Extraction and Classification
-# ---------------------------
-def build_cnn_transformer(input_shape, num_classes):
-    inputs = Input(shape=input_shape)
-    x = Conv1D(filters=64, kernel_size=5, activation='relu')(inputs)
-    x = BatchNormalization()(x)
-    x = Conv1D(filters=128, kernel_size=5, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Conv1D(filters=128, kernel_size=5, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    x = Conv1D(filters=256, kernel_size=5, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Conv1D(filters=512, kernel_size=5, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    x = MultiHeadAttention(num_heads=4, key_dim=64)(x, x)
-    x = LayerNormalization()(x)
-    x = GlobalAveragePooling1D()(x)
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.2)(x)
-    outputs = Dense(num_classes, activation='softmax')(x)
-
-    model = Model(inputs, outputs)
-    model.compile(optimizer=Adam(learning_rate=0.0005), loss='categorical_crossentropy', metrics=['accuracy'])
+def build_generator(noise_dim, data_dim):
+    model = Sequential()
+    model.add(Dense(128, input_dim=noise_dim))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(Dense(256))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(BatchNormalization(momentum=0.8))
+    model.add(Dense(data_dim, activation='tanh'))  # assume data is scaled
     return model
 
-# ---------------------------
-# Step 8: Reshape Data for CNN Input and Train Model
-# ---------------------------
-X_train_cnn = X_train_augmented.reshape(-1, encoding_dim, 1)
-X_test_cnn = X_test_reduced.reshape(-1, encoding_dim, 1)
+def build_discriminator(data_dim):
+    model = Sequential()
+    model.add(Dense(256, input_dim=data_dim))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(Dense(128))
+    model.add(LeakyReLU(alpha=0.2))
+    model.add(Dense(1, activation='sigmoid'))
+    return model
 
-cnn_transformer_model = build_cnn_transformer(input_shape=(encoding_dim, 1), num_classes=num_classes)
+generator = build_generator(noise_dim, data_dim)
+discriminator = build_discriminator(data_dim)
+discriminator.compile(loss='binary_crossentropy', optimizer=Adam(0.0002, 0.5), metrics=['accuracy'])
 
-history = cnn_transformer_model.fit(
-    X_train_cnn, y_train_one_hot,
-    validation_split=0.25,
-    epochs=200,
-    batch_size=500,
-    callbacks=[EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)]
-)
+# Combined GAN model (freeze discriminator for generator training)
+z = Input(shape=(noise_dim,))
+synthetic_sample = generator(z)
+discriminator.trainable = False
+validity = discriminator(synthetic_sample)
+combined = Model(z, validity)
+combined.compile(loss='binary_crossentropy', optimizer=Adam(0.0002, 0.5))
 
-# ---------------------------
-# Step 9: Evaluate the Model
-# ---------------------------
-y_pred_proba = cnn_transformer_model.predict(X_test_cnn)
-y_pred = np.argmax(y_pred_proba, axis=1)
+# Train the GAN
+epochs = 300      # adjust epochs as needed
+batch_size = 128
+real_data = X_reduced
 
-accuracy = accuracy_score(y_test, y_pred)
-precision = precision_score(y_test, y_pred, average='macro')
-recall = recall_score(y_test, y_pred, average='macro')
-f1 = f1_score(y_test, y_pred, average='macro')
+for epoch in range(epochs):
+    # Train Discriminator
+    idx = np.random.randint(0, real_data.shape[0], batch_size)
+    real_samples = real_data[idx]
+    noise = np.random.normal(0, 1, (batch_size, noise_dim))
+    synthetic_samples = generator.predict(noise)
 
-print(f"Accuracy: {accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall: {recall:.4f}")
-print(f"F1 Score: {f1:.4f}")
+    d_loss_real = discriminator.train_on_batch(real_samples, np.ones((batch_size, 1)))
+    d_loss_fake = discriminator.train_on_batch(synthetic_samples, np.zeros((batch_size, 1)))
+    d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
 
-cm = confusion_matrix(y_test, y_pred)
-ConfusionMatrixDisplay(cm, display_labels=label_encoder.classes_).plot(cmap='Blues')
+    # Train Generator
+    noise = np.random.normal(0, 1, (batch_size, noise_dim))
+    g_loss = combined.train_on_batch(noise, np.ones((batch_size, 1)))
+
+    if epoch % 100 == 0:
+        print(f"Epoch {epoch}, D loss: {d_loss[0]:.4f}, G loss: {g_loss:.4f}")
+
+# Generate 200 synthetic samples after GAN training
+noise = np.random.normal(0, 1, (200, noise_dim))
+synthetic_data = generator.predict(noise)
+
+# For demonstration, assign synthetic labels randomly from the real label set.
+unique_labels = np.unique(y)
+synthetic_labels = np.random.choice(unique_labels, size=200)
+
+# Augment original training data with synthetic data
+X_augmented = np.concatenate((X_reduced, synthetic_data), axis=0)
+y_augmented = np.concatenate((y, synthetic_labels), axis=0)
+
+# 5. Define the Combined Model (CNN + Transformer)
+def create_combined_model(input_shape, num_classes):
+    inputs = Input(shape=input_shape)
+
+    # CNN Branch
+    cnn = Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')(inputs)
+    cnn = MaxPooling1D(pool_size=2)(cnn)
+    cnn = Dropout(0.3)(cnn)
+    cnn = Flatten()(cnn)
+
+    # Transformer Branch
+    transformer = MultiHeadAttention(num_heads=4, key_dim=64)(inputs, inputs)
+    transformer = Dropout(0.1)(transformer)
+    transformer = LayerNormalization(epsilon=1e-6)(transformer)
+    transformer = Flatten()(transformer)
+
+    # Merge branches
+    combined_branch = tf.keras.layers.concatenate([cnn, transformer])
+    dense = Dense(64, activation='relu')(combined_branch)
+    outputs = Dense(num_classes, activation='softmax')(dense)
+
+    model = Model(inputs, outputs)
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+# 6. Cross Validation with StratifiedKFold and Confusion Matrix
+num_classes = len(unique_labels)
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# Helper function to reshape data (models expect [samples, sequence_length, channels])
+def reshape_for_model(X):
+    return X.reshape(-1, data_dim, 1)
+
+X_augmented_reshaped = reshape_for_model(X_augmented)
+
+all_true = []
+all_pred = []
+fold = 1
+
+for train_index, val_index in skf.split(X_augmented, y_augmented):
+    print(f"\nFold {fold}")
+    X_train, X_val = X_augmented[train_index], X_augmented[val_index]
+    y_train, y_val = y_augmented[train_index], y_augmented[val_index]
+
+    X_train_reshaped = reshape_for_model(X_train)
+    X_val_reshaped = reshape_for_model(X_val)
+
+    model = create_combined_model((data_dim, 1), num_classes)
+    model.fit(X_train_reshaped, y_train, epochs=10, batch_size=32, verbose=0)
+    score = model.evaluate(X_val_reshaped, y_val, verbose=0)
+    print(f"Fold {fold} Accuracy: {score[1]:.4f}")
+
+    y_val_pred = np.argmax(model.predict(X_val_reshaped), axis=1)
+    all_true.extend(y_val)
+    all_pred.extend(y_val_pred)
+
+    fold += 1
+
+# Compute confusion matrices
+cm = confusion_matrix(all_true, all_pred)
+cm_norm = confusion_matrix(all_true, all_pred, normalize='true')
+
+print("\nRaw Confusion Matrix:")
+print(cm)
+print("\nNormalized Confusion Matrix:")
+print(cm_norm)
+
+# Plot confusion matrices
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+sns.heatmap(cm, annot=True, fmt="d", cmap='Blues')
 plt.title("Confusion Matrix")
-plt.xticks(rotation=90)
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+
+plt.subplot(1, 2, 2)
+sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap='Blues')
+plt.title("Normalized Confusion Matrix")
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+
+plt.tight_layout()
 plt.show()
