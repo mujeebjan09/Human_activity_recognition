@@ -14,33 +14,40 @@ from tensorflow.keras.layers import (Input, Dense, Conv1D, MaxPooling1D, Flatten
 from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.optimizers import Adam
 
-# 1. Load dataset
+# ============================
+# 1. Load and Preprocess Data
+# ============================
+# Load train/test datasets (adjust file paths as needed)
 train = pd.read_csv('/content/train.csv')
 test = pd.read_csv('/content/test.csv')
 
 # Extract features and labels (assuming the last two columns are not features)
 X = train.iloc[:, :-2]
-y = train['Activity'].values
+y = train['Activity'].values  # original labels as strings
 
-# Convert string labels to integers
+# Encode labels into integers
 le = LabelEncoder()
 y = le.fit_transform(y)
 
-# 2. Preprocessing: Scale features
+# Scale features
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# 3. Feature Selection: Select top 125 features using ExtraTreesClassifier
+# Select top 125 features using ExtraTreesClassifier
 feat_selector = ExtraTreesClassifier(n_estimators=100, random_state=42)
 feat_selector.fit(X_scaled, y)
 importances = feat_selector.feature_importances_
 top_indices = np.argsort(importances)[-125:]
 X_reduced = X_scaled[:, top_indices]
 
-# 4. GAN for Synthetic Data Generation
+# ================================
+# 2. Synthetic Data Generation via GAN
+# ================================
+# Define GAN parameters
 noise_dim = 100
 data_dim = 125  # after feature selection
 
+# Build Generator model
 def build_generator(noise_dim, data_dim):
     model = Sequential()
     model.add(Dense(128, input_dim=noise_dim))
@@ -52,6 +59,7 @@ def build_generator(noise_dim, data_dim):
     model.add(Dense(data_dim, activation='tanh'))  # assume data is scaled
     return model
 
+# Build Discriminator model
 def build_discriminator(data_dim):
     model = Sequential()
     model.add(Dense(256, input_dim=data_dim))
@@ -65,23 +73,27 @@ generator = build_generator(noise_dim, data_dim)
 discriminator = build_discriminator(data_dim)
 discriminator.compile(loss='binary_crossentropy', optimizer=Adam(0.0002, 0.5), metrics=['accuracy'])
 
-# Combined GAN model (freeze discriminator for generator training)
+# Combined GAN model (freeze discriminator during generator training)
 z = Input(shape=(noise_dim,))
 synthetic_sample = generator(z)
 discriminator.trainable = False
 validity = discriminator(synthetic_sample)
-combined = Model(z, validity)
-combined.compile(loss='binary_crossentropy', optimizer=Adam(0.0002, 0.5))
+combined_gan = Model(z, validity)
+combined_gan.compile(loss='binary_crossentropy', optimizer=Adam(0.0002, 0.5))
 
-# Train the GAN
-epochs = 300      # adjust epochs as needed
+# GAN Training parameters
+epochs = 500      # adjust epochs as needed
 batch_size = 128
 real_data = X_reduced
 
+# GAN Training Loop
 for epoch in range(epochs):
-    # Train Discriminator
+    # ---------------------
+    #  Train Discriminator
+    # ---------------------
     idx = np.random.randint(0, real_data.shape[0], batch_size)
     real_samples = real_data[idx]
+
     noise = np.random.normal(0, 1, (batch_size, noise_dim))
     synthetic_samples = generator.predict(noise)
 
@@ -89,10 +101,13 @@ for epoch in range(epochs):
     d_loss_fake = discriminator.train_on_batch(synthetic_samples, np.zeros((batch_size, 1)))
     d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
 
-    # Train Generator
+    # ---------------------
+    #  Train Generator
+    # ---------------------
     noise = np.random.normal(0, 1, (batch_size, noise_dim))
-    g_loss = combined.train_on_batch(noise, np.ones((batch_size, 1)))
+    g_loss = combined_gan.train_on_batch(noise, np.ones((batch_size, 1)))
 
+    # Print every 100 epochs
     if epoch % 100 == 0:
         print(f"Epoch {epoch}, D loss: {d_loss[0]:.4f}, G loss: {g_loss:.4f}")
 
@@ -108,41 +123,46 @@ synthetic_labels = np.random.choice(unique_labels, size=200)
 X_augmented = np.concatenate((X_reduced, synthetic_data), axis=0)
 y_augmented = np.concatenate((y, synthetic_labels), axis=0)
 
-# 5. Define the Combined Model (CNN + Transformer)
+# ============================
+# 3. Define the Combined Model (CNN + Transformer)
+# ============================
 def create_combined_model(input_shape, num_classes):
     inputs = Input(shape=input_shape)
 
-    # CNN Branch
+    # --- CNN Branch ---
     cnn = Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')(inputs)
     cnn = MaxPooling1D(pool_size=2)(cnn)
     cnn = Dropout(0.3)(cnn)
     cnn = Flatten()(cnn)
 
-    # Transformer Branch
+    # --- Transformer Branch ---
     transformer = MultiHeadAttention(num_heads=4, key_dim=64)(inputs, inputs)
     transformer = Dropout(0.1)(transformer)
     transformer = LayerNormalization(epsilon=1e-6)(transformer)
     transformer = Flatten()(transformer)
 
-    # Merge branches
-    combined_branch = tf.keras.layers.concatenate([cnn, transformer])
-    dense = Dense(64, activation='relu')(combined_branch)
+    # --- Merge Branches ---
+    combined = tf.keras.layers.concatenate([cnn, transformer])
+    dense = Dense(64, activation='relu')(combined)
     outputs = Dense(num_classes, activation='softmax')(dense)
 
     model = Model(inputs, outputs)
     model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     return model
 
-# 6. Cross Validation with StratifiedKFold and Confusion Matrix
+# ============================
+# 4. Cross Validation & Evaluation with Confusion Matrices
+# ============================
 num_classes = len(unique_labels)
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-# Helper function to reshape data (models expect [samples, sequence_length, channels])
+# Function to reshape data for our model: (samples, sequence_length, channels)
 def reshape_for_model(X):
     return X.reshape(-1, data_dim, 1)
 
 X_augmented_reshaped = reshape_for_model(X_augmented)
 
+# Accumulate predictions for final confusion matrix
 all_true = []
 all_pred = []
 fold = 1
@@ -156,22 +176,31 @@ for train_index, val_index in skf.split(X_augmented, y_augmented):
     X_val_reshaped = reshape_for_model(X_val)
 
     model = create_combined_model((data_dim, 1), num_classes)
-    model.fit(X_train_reshaped, y_train, epochs=10, batch_size=32, verbose=0)
-    score = model.evaluate(X_val_reshaped, y_val, verbose=0)
-    print(f"Fold {fold} Accuracy: {score[1]:.4f}")
+    # Train model and show validation metrics per epoch
+    history = model.fit(X_train_reshaped, y_train,
+                        epochs=100,
+                        batch_size=128,
+                        validation_data=(X_val_reshaped, y_val),
+                        verbose=1)
+    
+    # Print the final validation accuracy for the fold
+    final_val_acc = history.history['val_accuracy'][-1]
+    print(f"Fold {fold} Final Validation Accuracy: {final_val_acc:.4f}")
 
+    # Predict on validation data
     y_val_pred = np.argmax(model.predict(X_val_reshaped), axis=1)
     all_true.extend(y_val)
     all_pred.extend(y_val_pred)
 
     fold += 1
 
-# Compute confusion matrices
+# Compute the raw confusion matrix
 cm = confusion_matrix(all_true, all_pred)
-cm_norm = confusion_matrix(all_true, all_pred, normalize='true')
-
 print("\nRaw Confusion Matrix:")
 print(cm)
+
+# Compute normalized confusion matrix (normalized by true labels)
+cm_norm = confusion_matrix(all_true, all_pred, normalize='true')
 print("\nNormalized Confusion Matrix:")
 print(cm_norm)
 
